@@ -337,7 +337,8 @@ async def c_apk(cb: CallbackQuery, state: FSMContext):
     await show(cb, f"📦 <b>Дамп APK</b>\n{LINE}\n"
                    f"Скинь либу до <b>{cap} МБ</b>.\n\n"
                    "Подходит: <code>.apk</code> · <code>.xapk</code> · <code>.zip</code> · <code>.so</code>\n"
-                   "После дампа пришлю <b>zip</b>: <code>dump.cs</code> и всё остальное.", BACK)
+                   "После дампа пришлю <b>zip</b>: <code>dump.cs</code> и всё остальное.\n\n"
+                   "🧩 Либа и metadata отдельно? Кидай по очереди (<code>.so</code> / <code>.dat</code> / zip), порядок любой.", BACK)
     await cb.answer()
 
 
@@ -353,7 +354,9 @@ async def c_exe(cb: CallbackQuery, state: FSMContext):
     await show(cb, f"🖥 <b>Дамп EXE</b>\n{LINE}\n"
                    f"Скинь файл до <b>{cap} МБ</b>.\n\n"
                    "Подходит: <code>.exe</code> · <code>.dll</code> · <code>.zip</code> (папка игры)\n"
-                   "Unity IL2CPP / Mono / .NET / native — метод выберу сам.", BACK)
+                   "Unity IL2CPP / Mono / .NET / native — метод выберу сам.\n\n"
+                   "🧲 Достаю вложенное: dll/exe из ресурсов, оверлей, зашитые zip/7z, base64-PE, "
+                   "Costura-библиотеки. Показываю, какие либы влинкованы (ImGui, MinHook, DX, OpenSSL…).", BACK)
     await cb.answer()
 
 
@@ -365,14 +368,13 @@ async def fetch(bot: Bot, file_id: str, dst: Path) -> None:
         await bot.download_file(f.file_path, destination=dst)
 
 
-async def execute(m: Message, bot: Bot, mode: str, work: Path, src: Path,
-                  meta: Path | None, st: Message) -> str:
-    """-> 'done' | 'need_meta' | 'fail'"""
-    uid = m.from_user.id
+async def execute(m: Message, bot: Bot, uid: int, mode: str, work: Path, src: Path,
+                  meta: Path | None, st: Message, native_only: bool = False):
+    """-> (status, ref): 'done' | 'fail' | 'need_meta' | 'need_lib'; ref = the file we keep while waiting for the pair."""
     try:
         await st.edit_text("🔬 <b>Дампаю…</b>\n<i>это может занять пару минут</i>")
         async with SEM:
-            out, rep = await dumper.dump(src, work, mode, meta)
+            out, rep = await dumper.dump(src, work, mode, meta, native_only)
         zp = work / f"ZovPatron_{src.stem[:40]}_{now()}.zip"
         limit = (LOCAL_UP_MB if LOCAL_API else CLOUD_UP_MB) * MB
         size, light = await asyncio.to_thread(dumper.make_zip, out, zp, limit)
@@ -380,20 +382,26 @@ async def execute(m: Message, bot: Bot, mode: str, work: Path, src: Path,
         await m.answer_document(
             FSInputFile(zp),
             caption=(f"✅ <b>Дамп готов</b>\n{LINE}\n🧬 {html.escape(rep)}\n📦 {size / MB:.1f} МБ"
-                     + ("\n<i>архив облегчён (без DummyDll) — лимит Telegram</i>" if light else "")),
+                     + ("\n<i>архив облегчён (без DummyDll/project) — лимит Telegram</i>" if light else "")),
             reply_markup=BACK)
         await db.run("UPDATE users SET dumps=dumps+1 WHERE id=?", (uid,))
         await st.delete()
-        return "done"
-    except dumper.NeedMeta:
-        await st.edit_text("🧩 <b>Это IL2CPP-бинарь.</b>\nТеперь скинь <code>global-metadata.dat</code>", reply_markup=BACK)
-        return "need_meta"
+        return "done", None
+    except dumper.NeedMeta as e:
+        await st.edit_text("🧩 <b>Нашёл IL2CPP-либу.</b>\nТеперь скинь <code>global-metadata.dat</code> "
+                           "(или zip/apk, где он лежит).",
+                           reply_markup=kb([btn("⚙️ Только нативный анализ", "native_only")], [btn("⬅️ Назад", "menu")]))
+        return "need_meta", e.lib or src
+    except dumper.NeedLib as e:
+        await st.edit_text("🧩 <b>Нашёл global-metadata.dat.</b>\nТеперь скинь <code>libil2cpp.so</code> "
+                           "(или GameAssembly.dll, либо zip/apk с ней).", reply_markup=BACK)
+        return "need_lib", e.meta
     except dumper.DumpError as e:
         await st.edit_text(f"❌ <b>Не получилось</b>\n<code>{html.escape(str(e))}</code>", reply_markup=BACK)
     except Exception:
         log.exception("dump crashed")
         await st.edit_text("❌ внутренняя ошибка, попробуй другой файл", reply_markup=BACK)
-    return "fail"
+    return "fail", None
 
 
 async def ingest(m: Message, state: FSMContext, bot: Bot, mode: str) -> None:
@@ -417,11 +425,11 @@ async def ingest(m: Message, state: FSMContext, bot: Bot, mode: str) -> None:
         except Exception:
             log.exception("download failed")
             return await st.edit_text("❌ не смог скачать файл", reply_markup=BACK)
-        res = await execute(m, bot, mode, work, src, None, st)
-        if res == "need_meta":
+        res, ref = await execute(m, bot, uid, mode, work, src, None, st)
+        if res in ("need_meta", "need_lib"):
             keep = True
             await state.set_state(St.meta)
-            await state.update_data(work=str(work), src=str(src), mode=mode)
+            await state.update_data(work=str(work), first=str(ref), need=res[5:], mode=mode)
     finally:
         BUSY.discard(uid)
         if not keep:
@@ -440,23 +448,67 @@ async def m_exe(m: Message, state: FSMContext, bot: Bot):
 
 @r.message(St.meta, F.document)
 async def m_meta(m: Message, state: FSMContext, bot: Bot):
+    """Second half of the il2cpp pair. .so / .dat / zip / apk / xapk, any order."""
     data = await state.get_data()
-    work, src, mode = Path(data["work"]), Path(data["src"]), data["mode"]
-    if not (m.document.file_name or "").lower().endswith(".dat"):
-        return await m.answer("нужен файл <code>global-metadata.dat</code>", reply_markup=BACK)
+    work, first, mode, need = Path(data["work"]), Path(data["first"]), data["mode"], data["need"]
     uid = m.from_user.id
+    d = m.document
+    name = (d.file_name or "").lower()
+    cap = MAX_MB if LOCAL_API else CLOUD_DL_MB
+    if d.file_size and d.file_size > cap * MB:
+        return await m.answer(f"❌ файл больше {cap} МБ", reply_markup=BACK)
+    allowed = (".dat", ".zip", ".apk", ".xapk") if need == "meta" else (".so", ".dll", ".zip", ".apk", ".xapk")
+    if not name.endswith(allowed):
+        what = "<code>global-metadata.dat</code> (или zip/apk с ним)" if need == "meta" else "<code>libil2cpp.so</code> / <code>GameAssembly.dll</code> (или zip/apk с ней)"
+        return await m.answer(f"нужен {what}", reply_markup=BACK)
     if uid in BUSY:
         return await m.answer("⏳ дамп уже идёт")
     BUSY.add(uid)
+    keep = False
     try:
-        st = await m.answer("⏬ <b>Скачиваю metadata…</b>")
-        meta = work / "global-metadata.dat"
+        st = await m.answer("⏬ <b>Скачиваю второй файл…</b>")
+        second = work / ("2_" + dumper.safe_name(d.file_name or "file"))
         try:
-            await fetch(bot, m.document.file_id, meta)
+            await fetch(bot, d.file_id, second)
         except Exception:
-            log.exception("meta download failed")
-            return await st.edit_text("❌ не смог скачать файл", reply_markup=BACK)
-        await execute(m, bot, mode, work, src, meta, st)
+            log.exception("download failed")
+            keep = True
+            return await st.edit_text("❌ не смог скачать файл, пришли ещё раз", reply_markup=BACK)
+        if name.endswith((".zip", ".apk", ".xapk")):
+            try:
+                second = await asyncio.to_thread(dumper.pick_from_zip, second, work / "y", need, mode == "exe")
+            except dumper.DumpError as e:
+                keep = True
+                return await st.edit_text(f"❌ {html.escape(str(e))}", reply_markup=BACK)
+            if second is None:
+                keep = True
+                what = "global-metadata.dat" if need == "meta" else "libil2cpp.so / GameAssembly.dll"
+                return await st.edit_text(f"❌ в архиве нет <code>{what}</code>, пришли другой", reply_markup=BACK)
+        lib, meta = (first, second) if need == "meta" else (second, first)
+        await execute(m, bot, uid, mode, work, lib, meta, st)
+    finally:
+        BUSY.discard(uid)
+        if not keep:
+            shutil.rmtree(work, ignore_errors=True)
+            await state.clear()
+            await state.set_state(St.apk if mode == "apk" else St.exe)
+
+
+@r.callback_query(St.meta, F.data == "native_only")
+async def c_native(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    """No metadata available (encrypted / missing): analyse the il2cpp binary as a plain native lib."""
+    data = await state.get_data()
+    uid = cb.from_user.id
+    if data.get("need") != "meta":
+        return await cb.answer()
+    if uid in BUSY:
+        return await cb.answer("⏳ дамп уже идёт", show_alert=True)
+    BUSY.add(uid)
+    work, mode = Path(data["work"]), data["mode"]
+    try:
+        await cb.answer()
+        st = await cb.message.answer("🔬 <b>Нативный анализ…</b>")
+        await execute(cb.message, bot, uid, mode, work, Path(data["first"]), None, st, native_only=True)
     finally:
         BUSY.discard(uid)
         shutil.rmtree(work, ignore_errors=True)

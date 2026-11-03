@@ -7,7 +7,7 @@ ENV DOTNET_ROOT=/usr/share/dotnet \
     ILSPY_CMD=/root/.dotnet/tools/ilspycmd \
     IL2CPP_DIR=/opt/il2cppdumper \
     PYTHONUNBUFFERED=1
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates unzip \
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates unzip binutils \
     && rm -rf /var/lib/apt/lists/*
 # .NET 8 SDK (ilspycmd) — Il2CppDumper net6 build runs on it via DOTNET_ROLL_FORWARD=Major
 RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/di.sh \
